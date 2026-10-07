@@ -1,0 +1,19 @@
+project:
+  type: default
+  output-dir: _output
+  render:
+    - index.qmd     # plain `quarto render` builds only the manuscript
+
+execute:
+  freeze: auto      # cache results; re-run a file only when its code changes
+
+jupyter: python3
+
+format:
+  html:
+    toc: true
+    number-section: true
+    code-fold: true
+  pdf:
+    documentclass: article
+    number-sections: true

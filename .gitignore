@@ -1,0 +1,17 @@
+# Quarto
+/.quarto/
+/_output/
+# keep /_freeze/ tracked: it stores cached execution results
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+
+# OS
+.DS_Store
+
+**/*.quarto_ipynb

@@ -1,0 +1,31 @@
+---
+title: "EEG Source Reconstruction with Physics-Informed Neural Networks"
+author:
+  - name: Nino Herve
+    email: herve.nino@gmail.com
+date: last-modified
+abstract: |
+  TODO: one-paragraph summary of the problem, approach, and main results.
+keywords: [EEG, source reconstruction, inverse problems, PINN]
+---
+
+## Introduction
+
+TODO: motivate EEG source reconstruction and why PINNs are a promising approach.
+
+## Methods
+
+TODO: forward model, PINN formulation, loss terms, training setup.
+
+## Results
+
+TODO
+
+## Discussion
+
+TODO
+
+## References {.unnumbered}
+
+::: {#refs}
+:::
