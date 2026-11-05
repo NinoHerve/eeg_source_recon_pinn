@@ -2,6 +2,13 @@
 /.quarto/
 /_output/
 # keep /_freeze/ tracked: it stores cached execution results
+# stray output from rendering a single notebook outside _output/
+/*.html
+/*_files/
+
+# Claude Code
+CLAUDE.md
+ARCHITECTURE.md
 
 # Python
 __pycache__/

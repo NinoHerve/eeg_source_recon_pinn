@@ -1,13 +1,19 @@
-# Exploration of PINNs
+# PINN for a Damped Harmonic Oscillator
 
-The following is a tutorial by Andrew Ning to apply PINNs on a simple oscillator.
+This notebook follows a [tutorial by Andrew Ning](https://www.youtube.com/watch?v=1qyZaTF-MUQ) that applies a physics-informed neural network (PINN) to a simple damped oscillator.
 
 ```{python}
 import torch
 from torch import nn
 import numpy as np
 import matplotlib.pyplot as plt
+```
 
+A PINN is a neural network $\hat{y}_\theta(t)$ that approximates the solution of a differential equation. Instead of learning only from data, it is trained so that its output satisfies the equation itself. The network's derivatives with respect to its input are computed exactly with automatic differentiation and plugged into the equation, and the resulting residual is added to the loss. The method was introduced by [Raissi, Perdikaris and Karniadakis (2019)](https://doi.org/10.1016/j.jcp.2018.10.045). The oscillator example used here is popularised by Ben Moseley's blog post *So, what is a physics-informed neural network?* and its [companion code](https://github.com/benmoseley/harmonic-oscillator-pinn).
+
+The network takes the time $t$ as its only input and returns the displacement $y$. Because the solution is a smooth, one-dimensional function, a small fully connected network (MLP) is enough. The activation function must be differentiable at least as many times as the highest derivative in the equation, here twice. This rules out ReLU: its second derivative is zero almost everywhere, so the second derivative of a ReLU network would vanish and the physics term could not be evaluated. We therefore use the hyperbolic tangent, which is smooth (infinitely differentiable).
+
+```{python}
 class MLP(nn.Module):
     
     def __init__(self, hlayers, hwidth):
@@ -28,8 +34,20 @@ class MLP(nn.Module):
 
     def forward(self, t):
         return self.network(t)
+```
 
 
+The key property of a PINN is that the differential equation governing the solution becomes one of its loss terms. This constrains the network to behave according to the assumed physics. Here the physics is the damped harmonic oscillator,
+
+$$
+m \frac{d^2 y}{dt^2} + \mu \frac{dy}{dt} + k y = 0,
+$$
+
+with mass $m$, friction coefficient $\mu$ and spring constant $k$. The `physics` function returns the left-hand side, the residual, which is zero for the true solution.
+
+A differential equation alone has infinitely many solutions (including $y = 0$), so we also need conditions that select the right one. Since this is an initial-value problem, these are initial conditions rather than boundary conditions: the oscillator starts at $y(0) = 1$ with zero velocity, $y'(0) = 0$. The `boundary` function returns the residuals of both conditions.
+
+```{python}
 def physics(model, t, params):
 
     # unpack parameters
@@ -54,14 +72,28 @@ def boundary(model, tbc):
 
     # return residuals
     return ybc-1, dydt
+```
 
+The losses are evaluated at two kinds of points. The first is the initial point $t = 0$, where the initial conditions are enforced. These values come from the problem statement, not from measurements. (PINNs can also include a separate data loss on observed measurements) The second kind are *collocation points*: points we choose freely in the domain where the differential equation must hold. The network is only constrained where collocation points exist, so they must cover the whole interval on which we want the solution, here $t \in [0, 1]$. An evenly spaced grid is the simplest choice, but random sampling or adaptive placement are also common.
 
+```{python}
 def datapoints():
     tbc = torch.zeros(1, 1, requires_grad=True)
     tcol = torch.linspace(0, 1, 50, requires_grad=True).reshape(50,1)
 
     return tbc, tcol
+```
 
+
+Training works like any other neural network: compute the loss, backpropagate, and update the weights. The main difficulty is balancing the loss terms. They measure different quantities and therefore have very different scales. With $k = 400$, the physics residual is of order $10^2$ early in training, so its square easily dominates the initial-condition terms. If it does, the optimizer can settle on the trivial solution $y = 0$, which satisfies the equation perfectly but violates $y(0) = 1$. We therefore weight the physics loss down, using the hand-tuned weights from Ben Moseley's example ($\lambda_1 = 10^{-1}$, $\lambda_2 = 10^{-4}$):
+
+$$
+\mathcal{L} = \big(\hat{y}(0) - 1\big)^2 + \lambda_1 \, \hat{y}'(0)^2 + \lambda_2 \, \frac{1}{N} \sum_{i=1}^{N} r(t_i)^2,
+$$
+
+where $r$ is the physics residual at the $N$ collocation points. These weights are specific to this problem and would need retuning for other parameters.
+
+```{python}
 def train(tbc, tcol, params, model, optimizer):
 
     # set training mode
@@ -91,7 +123,11 @@ def train(tbc, tcol, params, model, optimizer):
 
     # return training loss
     return loss.item()
-    
+```
+
+Because this is a toy problem, the exact solution is known, and we use it as a reference. In the underdamped case ($\delta = \mu / 2m < \omega_0 = \sqrt{k/m}$, here $2 < 20$) it is a decaying cosine, $y(t) = e^{-\delta t} \, 2A \cos(\phi + \omega t)$ with $\omega = \sqrt{\omega_0^2 - \delta^2}$.
+
+```{python}
 def exact(t, params):
     m, mu, k = params
     delta = mu / (2*m)
@@ -104,6 +140,7 @@ def exact(t, params):
     return y
 ```
 
+Finally, we train the network using the single initial point and 50 collocation points. The output shows the training loss over the epochs, followed by the PINN prediction compared with the exact solution.
 
 ```{python}
 m = 1; mu = 4; k = 400

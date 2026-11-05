@@ -1,0 +1,181 @@
+# PINN for Waves
+
+In this tutorial we train a PINN to solve the wave equation on the classic example of a vibrating rope. We consider two scenarios:
+
+- a standing wave,
+- a propagating wave.
+
+We expect the standing wave to be easier to learn: its spatial shape never changes, only its amplitude oscillates in time. A propagating wave moves through the domain, so the PINN has to capture a real coupling between space and time.
+
+```{python}
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+from pinn import make_mlp, grad, grid, Term, Loss, train, set_seed, plot_history, plot_field
+```
+
+## The building blocks
+
+Most of the code of a PINN is the same from one problem to the next: the network, the training loop, the plots. Only the physics changes. So the generic parts live in a small package, `pinn/`, and this notebook only writes what is specific to the vibrating rope. The pieces we use are:
+
+- `make_mlp`: builds the network. As for the damped oscillator it is a simple MLP with `tanh` activations. The only difference is that it now takes two inputs, $x$ and $t$, because the rope's displacement $u(x, t)$ depends on both position and time.
+- `grad`: the derivative of the network's output with respect to one of its inputs, computed with automatic differentiation.
+- `grid`: builds the points where the loss is evaluated.
+- `Term` and `Loss`: put the loss together from separate pieces.
+- `train`: the standard training loop.
+- `plot_history` and `plot_field`: the usual plots.
+
+`set_seed` fixes the random initialisation of the network, so every run of this notebook gives the same result.
+
+```{python}
+set_seed(0)
+```
+
+## The physics
+
+The physics loss is now the residual of the wave equation:
+
+$$\frac{\partial^2 u}{\partial t^2} = c^2 \frac{\partial^2 u}{\partial x^2}$$
+
+Because the equation is second order in space, we need two boundary conditions, one at each end of the rope. The rope is attached at $x = 0$ and $x = L$, so its displacement there is zero at all times: $u(0, t) = u(L, t) = 0$.
+
+Every condition is written the same way: a function that takes the network and a set of points, and returns a *residual*, which is zero when the condition holds. A set of points is a dictionary holding the $x$ values and the $t$ values separately (`pts["x"]`, `pts["t"]`), so we can differentiate with respect to each one. The small helper `u` glues them back together and evaluates the network.
+
+```{python}
+def u(model, pts):
+    return model(torch.cat([pts["x"], pts["t"]], dim=1))
+
+def wave_residual(model, pts, c):
+    out = u(model, pts)
+    u_tt = grad(grad(out, pts["t"]), pts["t"])
+    u_xx = grad(grad(out, pts["x"]), pts["x"])
+    return u_tt - c**2 * u_xx
+
+def fixed_ends(model, pts):
+    return u(model, pts)
+```
+
+Writing every condition with the same shape is what lets the shared code treat them all alike: the loss doesn't need to know whether a function is the physics or a boundary condition.
+
+## The points
+
+The collocation points now form a grid over space and time, giving $n_x \times n_t$ points instead of $n_t$ (900 points for a 30 × 30 grid). More generally, a regular grid with $N$ points per axis has $N^d$ points in $d$ dimensions, so its size grows exponentially with the number of dimensions. We also need points on the initial line ($t = 0$) and on the two ends of the rope ($x = 0$ and $x = L$).
+
+`grid` builds all three. Each variable is given either as a range `(start, stop, number of points)`, a list of exact values, or a single fixed value:
+
+```{python}
+L, T = 1.0, 2.0
+nx, nt = 30, 30
+
+points = {
+    "collocation": grid(x=(0, L, nx), t=(0, T, nt)),   # inside the domain
+    "initial":     grid(x=(0, L, nx), t=0.0),          # the line t = 0
+    "ends":        grid(x=[0, L], t=(0, T, nt)),       # x = 0 and x = L
+}
+```
+
+## Standing wave
+
+In a standing wave, the rope keeps the shape of a sine wave whose amplitude oscillates in time. Some points never move (the *nodes*), and the points between them move up and down the most (the *antinodes*). The wave does not travel along the rope, hence the name "standing" wave. <!-- Better description needed here. Add gif to visualize -->
+
+A rope fixed at both ends has infinitely many standing waves, called *modes*, indexed by an integer $n \geq 1$:
+
+$$u_n(x, t) = \sin\left(\frac{n \pi x}{L}\right) \cos\left(\frac{n \pi c\, t}{L}\right)$$
+
+Mode $n$ has $n$ half-wavelengths along the rope and oscillates at frequency $f_n = \frac{n c}{2L}$. The wave equation and the boundary conditions are the same for every mode, so the initial conditions alone decide which mode we get. Here we release the rope from rest ($\partial_t u(x, 0) = 0$) in the shape of mode $n$ ($u(x, 0) = \sin(n \pi x / L)$).
+
+```{python}
+def initial_shape(model, pts, n):
+    return u(model, pts) - torch.sin(n * torch.pi * pts["x"] / L)
+
+def initial_velocity(model, pts):
+    return grad(u(model, pts), pts["t"])
+```
+
+```{python}
+def exact(x, t, c, n):
+    return np.sin(n * np.pi * x / L) * np.cos(n * np.pi * c * t / L)
+```
+
+We show the whole solution as a single heatmap with space on the horizontal axis and time on the vertical axis. Each horizontal line is a snapshot of the rope at one instant, and moving up the vertical axis shows how the rope evolves. The right panel shows a few of these snapshots as curves.
+
+```{python}
+c = 1
+n = 3
+
+x = np.linspace(0, L, 200)
+t = np.linspace(0, T, 200)
+X, Tm = np.meshgrid(x, t)
+U = exact(X, Tm, c, n)
+
+fig, axes = plt.subplots(1, 2, figsize=(10,4))
+
+# full history: one image
+im = axes[0].pcolormesh(X, Tm, U, cmap="RdBu_r", vmin=-1, vmax=1)
+axes[0].set(xlabel="x", ylabel="t", title="u(x, t)")
+fig.colorbar(im, ax=axes[0])
+
+# Snapshots: the rope at a few instants
+for ti in [0, 0.25, 0.5, 0.75, 1.0]:
+    axes[1].plot(x, exact(x, ti, c, n), label=f"t = {ti}")
+axes[1].set(xlabel="x", ylabel="u", title="Rope at fixed times")
+axes[1].legend()
+```
+
+The loss has four terms:
+
+- two initial conditions: the rope's shape at $t = 0$ and its velocity at $t = 0$ (zero, since the rope starts from rest),
+- the boundary condition: the rope is fixed at both ends,
+- the physics loss: the residual of the wave equation at the collocation points.
+
+Each `Term` pairs a condition with the points where it is checked and a weight. `Loss` adds the terms up, each multiplied by its weight. For simplicity we start with all weights equal to one. As we will see, this stops working once the solution oscillates faster.
+
+Some of our functions need an extra argument (`c` or `n`). `Term` only passes the network and the points, so we wrap these functions in a `lambda`, a one-line function that fills in the extra argument. We put everything in a function of `n` so that we can build the loss for any mode.
+
+```{python}
+def standing_wave_loss(n, c=1):
+    return Loss({
+        "initial shape":    Term(lambda m, p: initial_shape(m, p, n), points["initial"]),
+        "initial velocity": Term(initial_velocity,                  points["initial"]),
+        "ends":             Term(fixed_ends,                        points["ends"]),
+        "physics":          Term(lambda m, p: wave_residual(m, p, c), points["collocation"]),
+    })
+```
+
+Everything is in place to train the PINN on the first standing mode ($n = 1$). `train` returns the history of each loss term separately, not only their sum. This lets us see which condition the network struggles with.
+
+```{python}
+n = 1
+model = make_mlp(n_in=2, width=32, depth=4)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+history = train(model, standing_wave_loss(n), optimizer, epochs=5000, log_every=500)
+
+plot_history(history)
+plot_field(model, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T));
+```
+
+As `n` increases, you will run into several problems:
+
+- **Sampling resolution**: mode $n$ has $n$ half-wavelengths in space, and with $T = 2$ and $c = 1$ it completes $n$ full periods in time. With `nx = nt = 30` that leaves only about $30/n$ points per half-wavelength, which is already too sparse at $n = 3$ or $4$. <!-- Give proposed solution in a box -->
+- **Spectral bias**: MLPs learn low frequencies first, so higher modes train much more slowly and the network can get stuck near the trivial solution $u = 0$. <!-- Give proposed solution in a box -->
+- **Loss balance**: the PDE residual scales like $(n \pi)^2$ because of the second derivatives, so it can overwhelm the initial-condition terms. <!-- Give proposed solution in a box -->
+
+Here is the same setup with $n = 3$. Compare the loss terms with the $n = 1$ run to see which ones get stuck.
+
+```{python}
+n = 3
+model = make_mlp(n_in=2, width=32, depth=4)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+history = train(model, standing_wave_loss(n), optimizer, epochs=5000, log_every=500)
+
+plot_history(history)
+plot_field(model, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T));
+```
+
+## Superpose modes
+
+
+## Propagating Wave
