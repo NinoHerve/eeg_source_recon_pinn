@@ -5,14 +5,22 @@ import numpy as np
 import torch
 
 
-def plot_history(history, ax=None):
+def plot_history(history, ax=None, ylabel="Loss"):
     """Training loss over epochs, total and each term, on a log scale.
-    Term values are unweighted."""
+    Term values are unweighted.
+
+    Also plots other histories with the same layout, e.g. the weights of
+    `Balance` (`ylabel="Weight"`). An "epoch" entry, if present, is used as
+    the horizontal axis instead of being plotted."""
     if ax is None:
         _, ax = plt.subplots()
+    epochs = history.get("epoch")
     for name, values in history.items():
-        ax.semilogy(values, label=name, lw=2 if name == "total" else 1)
-    ax.set(xlabel="Epochs", ylabel="Loss")
+        if name == "epoch":
+            continue
+        x = epochs if epochs is not None else np.arange(len(values))
+        ax.semilogy(x, values, label=name, lw=2 if name == "total" else 1)
+    ax.set(xlabel="Epochs", ylabel=ylabel)
     ax.legend()
     return ax
 

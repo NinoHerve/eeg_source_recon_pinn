@@ -97,3 +97,89 @@ def schedule(scheduler, every=1):
         if (epoch + 1) % every == 0:
             scheduler.step()
     return cb
+
+
+class Balance:
+    """Callback: reweight loss terms so each one pulls equally on the network.
+
+    balancer = Balance(every=100)
+    train(model, loss, optimizer, epochs, callbacks=[balancer])
+    plot_history(balancer.history, ylabel="Weight")
+
+    Some terms produce much larger gradients than others. In the wave
+    equation, the physics residual involves second derivatives, so its
+    gradients grow like (n*pi)**2 for mode n, and it can drown out the
+    initial conditions. Dividing the residual by (n*pi*c)**2 (`Term(scale=)`)
+    fixes this, but only if we know n. Balance measures the imbalance
+    instead: every `every` epochs it computes the size of each term's
+    gradient with respect to the network's parameters, and sets the weights
+    so that all terms pull equally hard. It needs no knowledge of the
+    solution.
+
+    Each update:
+      1. target weight of each term = 1 / (size of its gradient), scaled so
+         the weights average to 1 (only their ratios matter, so the overall
+         size of the loss, and the effective learning rate, stays the same),
+      2. smoothing: new = smoothing * old + (1 - smoothing) * target, so one
+         noisy gradient doesn't make the weights jump,
+      3. cap: the largest weight is never more than `max_ratio` times the
+         smallest. Without this, gradient-based weights can run away (in an
+         earlier test they reached ~1e11).
+
+    every      update the weights every `every` epochs.
+    smoothing  between 0 (use the new target as is) and 1 (never change).
+    max_ratio  largest allowed ratio between two weights.
+    terms      names of the terms to balance (None: all). Other terms keep
+               the weight you gave them.
+
+    Cost: one extra backward pass per balanced term at each update.
+    Use with Adam. L-BFGS remembers the shape of the loss from previous
+    steps, and changing the weights mid-run invalidates that memory: when
+    following Adam with L-BFGS, leave Balance out of the L-BFGS phase (the
+    last weights stay in place).
+
+    `balancer.history` is {"epoch": ..., <term name>: ...}, the weights after
+    each update.
+    """
+
+    eps = 1e-12
+
+    def __init__(self, every=100, smoothing=0.9, max_ratio=1e3, terms=None):
+        self.every = every
+        self.smoothing = smoothing
+        self.max_ratio = max_ratio
+        self.terms = terms
+        self._history = {"epoch": []}
+
+    @property
+    def history(self):
+        return {name: np.array(values) for name, values in self._history.items()}
+
+    def __call__(self, epoch, model, loss, history):
+        if (epoch + 1) % self.every:
+            return
+        names = list(loss.terms) if self.terms is None else list(self.terms)
+        for name in names:
+            if name not in loss.terms:
+                raise KeyError(f"Balance: no loss term named {name!r}; terms are {list(loss.terms)}")
+
+        params = [p for p in model.parameters() if p.requires_grad]
+        norms = []
+        for name in names:
+            grads = torch.autograd.grad(loss.terms[name](model), params, allow_unused=True)
+            norms.append(torch.sqrt(sum((g ** 2).sum() for g in grads if g is not None)).item())
+
+        target = 1.0 / (np.array(norms) + self.eps)
+        target /= target.mean()
+        old = np.array([loss.terms[name].weight for name in names], dtype=float)
+        w = self.smoothing * old + (1 - self.smoothing) * target
+
+        m = np.exp(np.log(w).mean())   # geometric mean: the cap is symmetric around it
+        half = np.sqrt(self.max_ratio)
+        w = np.clip(w, m / half, m * half)
+        w /= w.mean()
+
+        self._history["epoch"].append(epoch)
+        for name, value in zip(names, w):
+            loss.terms[name].weight = float(value)
+            self._history.setdefault(name, []).append(float(value))

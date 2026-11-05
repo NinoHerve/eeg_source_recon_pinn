@@ -12,19 +12,19 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from pinn import make_mlp, grad, grid, Term, Loss, train, set_seed, plot_history, plot_field
+from pinn import (make_mlp, grad, grid, Term, Loss, train, set_seed,
+                  plot_history, plot_field, relative_l2_error, Balance)
 ```
 
 ## The building blocks
-
-Most of the code of a PINN is the same from one problem to the next: the network, the training loop, the plots. Only the physics changes. So the generic parts live in a small package, `pinn/`, and this notebook only writes what is specific to the vibrating rope. The pieces we use are:
 
 - `make_mlp`: builds the network. As for the damped oscillator it is a simple MLP with `tanh` activations. The only difference is that it now takes two inputs, $x$ and $t$, because the rope's displacement $u(x, t)$ depends on both position and time.
 - `grad`: the derivative of the network's output with respect to one of its inputs, computed with automatic differentiation.
 - `grid`: builds the points where the loss is evaluated.
 - `Term` and `Loss`: put the loss together from separate pieces.
-- `train`: the standard training loop.
+- `train`: the standard training loop. It accepts *callbacks*, small functions it calls after each epoch to adjust the training; we use one later to balance the loss terms.
 - `plot_history` and `plot_field`: the usual plots.
+- `relative_l2_error`: one number that says how far the prediction is from the exact solution.
 
 `set_seed` fixes the random initialisation of the network, so every run of this notebook gives the same result.
 
@@ -36,7 +36,9 @@ set_seed(0)
 
 The physics loss is now the residual of the wave equation:
 
-$$\frac{\partial^2 u}{\partial t^2} = c^2 \frac{\partial^2 u}{\partial x^2}$$
+$$
+\frac{\partial^2 u}{\partial t^2} = c^2 \frac{\partial^2 u}{\partial x^2}
+$$
 
 Because the equation is second order in space, we need two boundary conditions, one at each end of the rope. The rope is attached at $x = 0$ and $x = L$, so its displacement there is zero at all times: $u(0, t) = u(L, t) = 0$.
 
@@ -93,23 +95,32 @@ def initial_velocity(model, pts):
     return grad(u(model, pts), pts["t"])
 ```
 
+
+The exact solution, written with numpy, is what we will compare the PINN against:
+
 ```{python}
 def exact(x, t, c, n):
     return np.sin(n * np.pi * x / L) * np.cos(n * np.pi * c * t / L)
 ```
 
+### Choose a mode
+
+Everything below depends on one number: the mode `n`. Set it here and re-run the notebook from this cell to see how the results change. `n = 1` is the easy case. From `n = 3` on, the plain network fails, which is the interesting part.
+
+```{python}
+n = 3   # the mode to learn: try 1, 2, 3, 4...
+c = 1   # wave speed
+```
+
 We show the whole solution as a single heatmap with space on the horizontal axis and time on the vertical axis. Each horizontal line is a snapshot of the rope at one instant, and moving up the vertical axis shows how the rope evolves. The right panel shows a few of these snapshots as curves.
 
 ```{python}
-c = 1
-n = 3
-
 x = np.linspace(0, L, 200)
 t = np.linspace(0, T, 200)
 X, Tm = np.meshgrid(x, t)
 U = exact(X, Tm, c, n)
 
-fig, axes = plt.subplots(1, 2, figsize=(10,4))
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
 
 # full history: one image
 im = axes[0].pcolormesh(X, Tm, U, cmap="RdBu_r", vmin=-1, vmax=1)
@@ -120,8 +131,10 @@ fig.colorbar(im, ax=axes[0])
 for ti in [0, 0.25, 0.5, 0.75, 1.0]:
     axes[1].plot(x, exact(x, ti, c, n), label=f"t = {ti}")
 axes[1].set(xlabel="x", ylabel="u", title="Rope at fixed times")
-axes[1].legend()
+axes[1].legend();
 ```
+
+### The loss
 
 The loss has four terms:
 
@@ -129,7 +142,7 @@ The loss has four terms:
 - the boundary condition: the rope is fixed at both ends,
 - the physics loss: the residual of the wave equation at the collocation points.
 
-Each `Term` pairs a condition with the points where it is checked and a weight. `Loss` adds the terms up, each multiplied by its weight. For simplicity we start with all weights equal to one. As we will see, this stops working once the solution oscillates faster.
+Each `Term` pairs a condition with the points where it is checked and a weight. `Loss` adds the terms up, each multiplied by its weight. For simplicity we keep all weights equal to one.
 
 Some of our functions need an extra argument (`c` or `n`). `Term` only passes the network and the points, so we wrap these functions in a `lambda`, a one-line function that fills in the extra argument. We put everything in a function of `n` so that we can build the loss for any mode.
 
@@ -143,37 +156,101 @@ def standing_wave_loss(n, c=1):
     })
 ```
 
-Everything is in place to train the PINN on the first standing mode ($n = 1$). `train` returns the history of each loss term separately, not only their sum. This lets us see which condition the network struggles with.
+### A plain network
+
+We first train the same plain network as for the damped oscillator. `train` returns the history of each loss term separately, not only their sum, so we can see which condition the network struggles with. To judge the result with a single number we use the *relative L2 error*: the size of the error divided by the size of the exact solution, both measured over the whole $(x, t)$ domain. It is 0 for a perfect prediction and 1 for a network that just predicts $u = 0$ everywhere.
 
 ```{python}
-n = 1
-model = make_mlp(n_in=2, width=32, depth=4)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+set_seed(0)
+plain = make_mlp(n_in=2, width=32, depth=4)
+optimizer = torch.optim.Adam(plain.parameters(), lr=1e-3)
 
-history = train(model, standing_wave_loss(n), optimizer, epochs=5000, log_every=500)
+history_plain = train(plain, standing_wave_loss(n, c), optimizer, epochs=5000, log_every=1000)
+error_plain = relative_l2_error(plain, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T))
+print(f"relative L2 error: {error_plain:.3f}")
 
-plot_history(history)
-plot_field(model, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T));
+plot_history(history_plain)
+plot_field(plain, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T));
 ```
 
-As `n` increases, you will run into several problems:
+### Why higher modes are hard
 
-- **Sampling resolution**: mode $n$ has $n$ half-wavelengths in space, and with $T = 2$ and $c = 1$ it completes $n$ full periods in time. With `nx = nt = 30` that leaves only about $30/n$ points per half-wavelength, which is already too sparse at $n = 3$ or $4$. <!-- Give proposed solution in a box -->
+With `n = 1` this works well. As `n` increases, you run into several problems:
+
+- **Sampling resolution**: mode $n$ has $n$ half-wavelengths in space, and with $T = 2$ and $c = 1$ it completes $n$ full periods in time. With `nx = nt = 30` that leaves only about $30/n$ points per half-wavelength, which is already sparse at $n = 3$ or $4$. <!-- Give proposed solution in a box -->
 - **Spectral bias**: MLPs learn low frequencies first, so higher modes train much more slowly and the network can get stuck near the trivial solution $u = 0$. <!-- Give proposed solution in a box -->
-- **Loss balance**: the PDE residual scales like $(n \pi)^2$ because of the second derivatives, so it can overwhelm the initial-condition terms. <!-- Give proposed solution in a box -->
+- **Loss balance**: the PDE residual scales like $(n \pi)^2$ because of the second derivatives, so it can overwhelm the initial-condition terms.
 
-Here is the same setup with $n = 3$. Compare the loss terms with the $n = 1$ run to see which ones get stuck.
+Here we tackle only the third problem, loss balance, and see how far that alone takes us.
+
+### Balancing the loss terms
+
+The total loss is a sum of four terms, and training lowers it by following its gradient: the direction in parameter space that reduces the loss fastest. That gradient is the sum of one gradient per term. If one term's gradient is much larger than the others, it decides the direction on its own, and the other conditions are barely taken into account.
+
+The physics term is the suspect here. It contains second derivatives, and each second derivative of mode $n$ brings out a factor $(n \pi)^2$. So for higher modes the physics term can pull much harder than the initial conditions, even though the initial conditions are what tell the network which mode we want ($u = 0$ satisfies the wave equation and the fixed ends perfectly).
+
+One fix is to divide the physics residual by $(n \pi c)^2$. But that requires knowing $n$, and in a real problem we don't know the frequency content of the answer in advance. We want a fix that uses only what we can measure during training.
+
+::: {.callout-tip}
+## Proposed solution: balance the terms by their gradients
+
+Every so often during training, measure how hard each term pulls on the network: the size of its gradient with respect to the network's parameters. Then set the weights so that every term pulls equally hard, with weight $\propto 1 / (\text{size of the term's gradient})$.
+
+`Balance` does this as a *callback*, a function that `train` calls after every epoch. Its settings:
+
+- `every = 100`: re-measure and update the weights every 100 epochs.
+- `smoothing = 0.9` (default): move the weights only 10% of the way towards the new target at each update, so one noisy measurement doesn't make them jump.
+- `max_ratio = 1000` (default): the largest weight is never more than 1000 times the smallest. Without this cap, gradient-based weights can run away and grow without limit.
+
+The weights always average to 1, so balancing changes how the terms compare to each other, not the overall size of the loss.
+:::
+
+Everything else stays the same as for the plain network: same network, same seed, same loss, same optimizer, same number of epochs. The only difference is the `Balance` callback. It also keeps a history of the weights it chose, which we plot to see how it reacted.
 
 ```{python}
-n = 3
-model = make_mlp(n_in=2, width=32, depth=4)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+set_seed(0)
+balanced = make_mlp(n_in=2, width=32, depth=4)
+optimizer = torch.optim.Adam(balanced.parameters(), lr=1e-3)
+balancer = Balance(every=100)
 
-history = train(model, standing_wave_loss(n), optimizer, epochs=5000, log_every=500)
+history_balanced = train(balanced, standing_wave_loss(n, c), optimizer, epochs=5000,
+                         callbacks=[balancer], log_every=1000)
+error_balanced = relative_l2_error(balanced, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T))
+print(f"relative L2 error: {error_balanced:.3f}")
 
-plot_history(history)
-plot_field(model, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T));
+plot_history(balancer.history, ylabel="Weight")
+plot_field(balanced, lambda x, t: exact(x, t, c, n), x=(0, L), t=(0, T));
 ```
+
+### Comparison
+
+The two loss histories side by side, on the same vertical scale. The curves show each term's value *without* its weight, so the two runs can be compared directly.
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
+plot_history(history_plain, ax=axes[0])
+plot_history(history_balanced, ax=axes[1])
+axes[0].set_title(f"Plain network (error {error_plain:.2f})")
+axes[1].set_title(f"Balanced (error {error_balanced:.2f})");
+```
+
+What to look for depends on the mode you chose. With 5000 epochs and seed 0 we get the table below. The last digit can change slightly between runs, because computations on many CPU cores are not exactly reproducible.
+
+| mode `n` | plain network | balanced |
+|---|---|---|
+| 1 | 0.07 | 0.32 |
+| 2 | 0.75 | 0.88 |
+| 3 | 0.90 | 1.06 |
+| 4 | 1.01 | 1.02 |
+
+Balancing makes things *worse* for every mode, even for the easy case `n = 1`. The weight plot shows why. For every mode, `Balance` ends up giving the **physics term the largest weight** (between 1.2 and 2.9) and the **initial shape and ends the smallest** (between 0.07 and 0.2). That is the opposite of what we wanted.
+
+Two things explain this.
+
+- `Balance` measures the gradients of the network *as it is now*, not of the true solution. The $(n\pi)^2$ factor only appears in the physics term once the network actually oscillates like mode $n$. A plain network stuck near a smooth, almost flat function has small second derivatives, so its physics gradient is small, and `Balance` raises the physics weight to compensate. But $u = 0$ satisfies the wave equation perfectly, so a stronger physics term pushes the network further towards the flat solution.
+- A term's gradient is large when that term is far from satisfied. The initial shape and the ends are the conditions the network is failing, so their gradients are large, and `Balance` *lowers* their weights. Equalizing the pulls therefore weakens exactly the conditions that tell the network which solution we want. For `n = 1` these conditions were doing their job, and weakening them is enough to spoil a result that was fine.
+
+So balancing by gradients is not a free fix: it only helps when the imbalance comes from the physics itself, not from the network being stuck. For that, the network first needs to be able to represent the oscillation, which is the second problem in our list, spectral bias.
 
 ## Superpose modes
 
